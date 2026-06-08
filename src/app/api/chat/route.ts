@@ -1,7 +1,4 @@
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { NextRequest } from 'next/server'
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
 
 export async function POST(req: NextRequest) {
   try {
@@ -14,33 +11,56 @@ export async function POST(req: NextRequest) {
     const systemPrompt = process.env.AI_SYSTEM_PROMPT ||
       'You are a helpful AI assistant with knowledge about everything. Be direct, concise, and genuinely useful.'
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
-      systemInstruction: systemPrompt,
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'meta-llama/llama-3.1-8b-instruct:free',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...messages
+        ],
+        stream: true,
+      }),
     })
 
-    const history = messages.slice(0, -1).map((m: { role: string; content: string }) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    }))
-
-    const lastMessage = messages[messages.length - 1]
-
-    const chat = model.startChat({ history })
-    const result = await chat.sendMessageStream(lastMessage.content)
+    if (!response.ok) {
+      const error = await response.text()
+      console.error('OpenRouter error:', error)
+      return new Response(JSON.stringify({ error: 'API error' }), { status: 500 })
+    }
 
     const encoder = new TextEncoder()
     const readable = new ReadableStream({
       async start(controller) {
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
         try {
-          for await (const chunk of result.stream) {
-            const text = chunk.text()
-            if (text) {
-              const data = `data: ${JSON.stringify({ text })}\n\n`
-              controller.enqueue(encoder.encode(data))
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            const chunk = decoder.decode(value)
+            const lines = chunk.split('\n')
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6)
+                if (data === '[DONE]') {
+                  controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+                  break
+                }
+                try {
+                  const parsed = JSON.parse(data)
+                  const text = parsed.choices?.[0]?.delta?.content
+                  if (text) {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
+                  }
+                } catch {}
+              }
             }
           }
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
           controller.close()
         } catch (err) {
           controller.error(err)
